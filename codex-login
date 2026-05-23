@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+"""Codex Login — OAuth-Login für mehrere Codex-Accounts mit automatischem OTP-Abruf via IMAP."""
+from __future__ import annotations
+
+import argparse
+import email as emaillib
+import imaplib
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Konfiguration via Umgebungsvariablen
+#
+#   CODEX_STORE_DIR    Verzeichnis für codex.env und state.json
+#                      (Standard: Verzeichnis dieses Scripts)
+#
+#   IMAP_HOST          IMAP-Server-Hostname  (z. B. imap.gmail.com)
+#   IMAP_PORT          IMAP-Port, SSL        (Standard: 993)
+#   IMAP_USER          IMAP-Login / E-Mail-Adresse
+#   IMAP_PASSWORD      IMAP-Passwort
+#   IMAP_OTP_SENDER    Absender-Filter für OTP-E-Mails (Standard: openai.com)
+# ---------------------------------------------------------------------------
+
+CODEX_HOME   = Path.home() / ".codex"
+ACTIVE_AUTH  = CODEX_HOME / "auth.json"
+SESSIONS_DIR = CODEX_HOME / "sessions"
+
+_store_env = os.environ.get("CODEX_STORE_DIR", "").strip()
+STORE_DIR  = Path(_store_env).resolve() if _store_env else Path(__file__).parent
+
+CODEX_ENV_PATH = STORE_DIR / "codex.env"
+STATE_PATH     = STORE_DIR / "state.json"
+
+OAUTH_AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+OAUTH_TOKEN_URL     = "https://auth.openai.com/oauth/token"
+OAUTH_CLIENT_ID     = "app_EMoamEEZ73f0CkXaXp7hrann"
+OAUTH_SCOPES        = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+
+OAUTH_PREFERRED_PORT = 1455
+OAUTH_FALLBACK_PORT  = 1457
+
+# ---------------------------------------------------------------------------
+# Zeit-Utilities
+# ---------------------------------------------------------------------------
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+# ---------------------------------------------------------------------------
+# IMAP OTP-Abruf
+# ---------------------------------------------------------------------------
+
+def _imap_config() -> tuple[str, int, str, str] | None:
+    host = os.environ.get("IMAP_HOST", "").strip()
+    user = os.environ.get("IMAP_USER", "").strip()
+    pw   = os.environ.get("IMAP_PASSWORD", "").strip()
+    port = int(os.environ.get("IMAP_PORT", "993"))
+    if not all([host, user, pw]):
+        return None
+    return host, port, user, pw
+
+
+def _fetch_otp_imap() -> str | None:
+    cfg = _imap_config()
+    if not cfg:
+        return None
+    host, port, user, pw = cfg
+    sender = os.environ.get("IMAP_OTP_SENDER", "openai.com").strip()
+    print(f"  Verbinde mit IMAP {host}:{port}...")
+    try:
+        with imaplib.IMAP4_SSL(host, port) as mail:
+            mail.login(user, pw)
+            mail.select("INBOX")
+
+            # Erst ungelesene suchen, dann alle
+            for criteria in (("UNSEEN", "FROM", f'"{sender}"'), ("FROM", f'"{sender}"')):
+                _, data = mail.search(None, *criteria)
+                ids = data[0].split() if data[0] else []
+                if ids:
+                    break
+            if not ids:
+                print(f"  Keine E-Mail von '{sender}' im Posteingang.")
+                return None
+
+            _, msg_data = mail.fetch(ids[-1], "(RFC822)")
+            raw = msg_data[0][1]
+            msg = emaillib.message_from_bytes(raw)
+
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/plain":
+                        try:
+                            body += part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        except Exception:
+                            pass
+            else:
+                try:
+                    body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+                except Exception:
+                    body = str(msg.get_payload())
+
+            # OTP extrahieren — Kontext-Match hat Vorrang
+            m = re.search(
+                r'(?:code|otp|verify|verification)[^\d]{0,60}(\d{6})'
+                r'|(\d{6})[^\d]{0,40}(?:code|otp|expire)',
+                body, re.IGNORECASE,
+            )
+            if m:
+                print("  OTP gefunden (Kontext-Match).")
+                return m.group(1) or m.group(2)
+
+            m = re.search(r'^\s*(\d{6})\s*$', body, re.MULTILINE)
+            if m:
+                print("  OTP gefunden (Einzelzeile).")
+                return m.group(1)
+
+            print("  Kein OTP im E-Mail-Inhalt gefunden.")
+    except imaplib.IMAP4.error as exc:
+        print(f"  IMAP-Fehler: {exc}")
+    except Exception as exc:
+        print(f"  IMAP-Fehler: {exc}")
+    return None
+
+
+def _fetch_otp(wait: bool = True) -> str | None:
+    if not _imap_config():
+        return None
+    if wait:
+        print("  Warte 15s auf E-Mail-Zustellung...")
+        time.sleep(15)
+    otp = _fetch_otp_imap()
+    if otp:
+        return otp
+    print("  Kein OTP — 10s warten und nochmal...")
+    time.sleep(10)
+    return _fetch_otp_imap()
+
+# ---------------------------------------------------------------------------
+# codex.env Parser
+# ---------------------------------------------------------------------------
+
+def parse_codex_env(path: Path) -> list[dict[str, str]]:
+    """Liest codex.env:
+      email=user1@example.com
+      email2=user2@example.com
+      password=masterpassword
+      workspace=business   # oder: personal
+    """
+    if not path.exists():
+        raise SystemExit(
+            f"codex.env nicht gefunden: {path}\n"
+            "Format:\n"
+            "  email=user1@example.com\n"
+            "  email2=user2@example.com\n"
+            "  password=masterpassword\n"
+        )
+    kv: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        kv[k.strip().lower()] = v.strip()
+
+    password  = kv.get("password", "")
+    workspace = kv.get("workspace", "business").lower()
+    accounts: list[dict[str, str]] = []
+    for key in sorted(kv):
+        if not re.match(r'^email\d*$', key):
+            continue
+        e = kv[key].strip()
+        if e:
+            accounts.append({"email": e, "password": password, "workspace": workspace})
+    return accounts
+
+
+def pick_account(accounts: list[dict[str, str]]) -> dict[str, str]:
+    if not accounts:
+        raise SystemExit("Keine Accounts in codex.env gefunden.")
+    state   = _load_state()
+    current = state.get("current")
+    print("\nVerfügbare Accounts:")
+    for i, acc in enumerate(accounts, 1):
+        e      = acc["email"]
+        info   = _limit_display(state.get(e, {}))
+        marker = " *" if e == current else ""
+        print(f"  {i}.{marker} {e}{info}")
+    raw = input("\nAuswahl (Nummer + Enter): ").strip()
+    if raw.isdigit():
+        idx = int(raw) - 1
+        if not (0 <= idx < len(accounts)):
+            raise SystemExit("Ungültige Nummer.")
+        return accounts[idx]
+    raise SystemExit("Bitte eine Zahl eingeben.")
+
+
+def _pick_workspace(default: str, force_personal: bool) -> str:
+    if force_personal:
+        return "personal"
+    label = "Personal" if default == "personal" else "Workspace"
+    ans = input(f"Tenant [{label}]  w=Workspace  p=Personal  Enter=übernehmen: ").strip().lower()
+    if ans == "p":
+        return "personal"
+    if ans == "w":
+        return "business"
+    return default
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+
+def _load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
+
+def _limit_display(account_state: dict) -> str:
+    if not account_state:
+        return ""
+    last_login = account_state.get("last_login")
+    limits     = account_state.get("limits")
+    parts: list[str] = []
+    if limits:
+        primary = limits.get("primary") or {}
+        used    = primary.get("used_percent")
+        resets  = primary.get("resets_at")
+        if isinstance(used, (int, float)):
+            free = max(0.0, 100.0 - float(used))
+            parts.append(f"5h {free:.0f}% frei")
+            if isinstance(resets, (int, float)) and resets > now().timestamp():
+                remaining = int((resets - now().timestamp()) / 60)
+                h, m = divmod(remaining, 60)
+                parts.append(f"reset in {h}h{m:02d}m" if h else f"reset in {m}m")
+    if last_login and not parts:
+        parts.append(f"Login: {last_login[:10]}")
+    return f" [{', '.join(parts)}]" if parts else ""
+
+# ---------------------------------------------------------------------------
+# OAuth / Token-Refresh
+# ---------------------------------------------------------------------------
+
+def refresh_tokens(auth_path: Path) -> bool:
+    try:
+        data          = json.loads(auth_path.read_text(encoding="utf-8"))
+        refresh_token = data.get("tokens", {}).get("refresh_token", "")
+        if not refresh_token:
+            return False
+    except Exception:
+        return False
+
+    payload = urllib.parse.urlencode({
+        "grant_type":    "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id":     OAUTH_CLIENT_ID,
+    }).encode()
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL, data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            result = json.loads(r.read())
+    except Exception:
+        return False
+
+    if not result.get("access_token"):
+        return False
+    data["tokens"]["access_token"] = result["access_token"]
+    if result.get("refresh_token"):
+        data["tokens"]["refresh_token"] = result["refresh_token"]
+    data["last_refresh"] = iso(now())
+    _write_auth(auth_path, data)
+    return True
+
+# ---------------------------------------------------------------------------
+# Auth-Datei schreiben
+# ---------------------------------------------------------------------------
+
+def _write_auth(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except PermissionError:
+        pass
+
+# ---------------------------------------------------------------------------
+# Playwright Hilfsfunktionen
+# ---------------------------------------------------------------------------
+
+def _wait_visible(page: object, selectors: list[str], timeout: int) -> object:
+    loc = page.locator(", ".join(selectors)).first
+    loc.wait_for(state="visible", timeout=timeout)
+    return loc
+
+
+def _submit(page: object, field: object | None = None) -> None:
+    for sel in [
+        'button[type="submit"]',
+        'button[data-action-button-primary="true"]',
+        'button:has-text("Continue")',
+        'button:has-text("Weiter")',
+        'button:has-text("Verify")',
+    ]:
+        btn = page.locator(sel).first
+        try:
+            if btn.count() > 0:
+                btn.click(timeout=2000)
+                return
+        except Exception:
+            continue
+    if field is not None:
+        try:
+            field.press("Enter")
+            return
+        except Exception:
+            pass
+    page.keyboard.press("Enter")
+
+
+def _fill_otp(page: object, otp: str) -> bool:
+    single = page.locator('input[name="code"], input[autocomplete="one-time-code"]').first
+    try:
+        if single.count() > 0:
+            single.fill(otp)
+            return True
+    except Exception:
+        pass
+    digits = page.locator('input[maxlength="1"], input[inputmode="numeric"]')
+    try:
+        if digits.count() >= 6:
+            try:
+                digits.first.fill(otp)
+                return True
+            except Exception:
+                for i, ch in enumerate(otp[:6]):
+                    digits.nth(i).fill(ch)
+                return True
+    except Exception:
+        pass
+    return False
+
+# ---------------------------------------------------------------------------
+# Consent-Seite (Workspace-Auswahl)
+# ---------------------------------------------------------------------------
+
+def _handle_consent(page: object, workspace: str) -> None:
+    from playwright.sync_api import TimeoutError as PWTimeout
+    try:
+        page.wait_for_url("**/sign-in-with-chatgpt/codex/consent**", timeout=10000)
+    except PWTimeout:
+        return
+    print(f"  Consent-Seite: wähle '{workspace}'...")
+    try:
+        if workspace == "personal":
+            page.locator(':text("Persönliches Konto"), :text("Personal account")').first.click(timeout=5000)
+        page.locator('button:has-text("Weiter"), button:has-text("Continue")').last.click(timeout=5000)
+    except Exception as e:
+        print(f"  Consent-Auswahl Fehler: {e} — bitte manuell klicken")
+
+# ---------------------------------------------------------------------------
+# Session-Log Scanner (Rate-Limits aus Codex JSONL-Dateien)
+# ---------------------------------------------------------------------------
+
+SESSION_TAIL_BYTES = 2 * 1024 * 1024
+SESSION_SCAN_LIMIT = 50
+
+
+def scan_session_limits(since: datetime | None = None) -> dict | None:
+    if not SESSIONS_DIR.exists():
+        return None
+    files = sorted(
+        (p for p in SESSIONS_DIR.rglob("*.jsonl") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:SESSION_SCAN_LIMIT]
+
+    best: tuple[datetime, dict] | None = None
+    for path in files:
+        if since and datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) < since:
+            continue
+        try:
+            with path.open("rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - SESSION_TAIL_BYTES))
+                raw = fh.read().decode("utf-8", errors="ignore")
+        except OSError:
+            continue
+        for line in reversed(raw.splitlines()):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = item.get("payload", {})
+            rl      = payload.get("rate_limits") if isinstance(payload, dict) else None
+            if not isinstance(rl, dict):
+                continue
+            ts_str = item.get("timestamp")
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")) if ts_str else None
+            except Exception:
+                ts = None
+            ts = ts or datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            if since and ts <= since:
+                break
+            event = {"observed_at": ts.isoformat(), "rate_limits": rl}
+            if best is None or ts > best[0]:
+                best = (ts, event)
+            break
+
+    return best[1] if best else None
+
+# ---------------------------------------------------------------------------
+# Login-Flow
+# ---------------------------------------------------------------------------
+
+def _start_codex_login() -> tuple[subprocess.Popen, str]:
+    import shutil
+    codex_bin = shutil.which("codex") or "/usr/local/bin/codex"
+    CODEX_HOME.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["DISPLAY"] = ""
+
+    proc = subprocess.Popen(
+        [codex_bin, "login"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env, text=True, bufsize=1,
+    )
+
+    url_re   = re.compile(r"https://auth\.openai\.com/oauth/authorize\S+")
+    deadline = time.time() + 15
+    authorize_url = ""
+    while time.time() < deadline:
+        line = proc.stdout.readline()  # type: ignore[union-attr]
+        if not line and proc.poll() is not None:
+            break
+        m = url_re.search(line)
+        if m:
+            authorize_url = m.group(0)
+            break
+
+    if not authorize_url:
+        proc.kill()
+        raise SystemExit("Codex-Login hat keine Auth-URL ausgegeben.")
+    return proc, authorize_url
+
+
+def do_login(name: str, email: str, password: str, workspace: str = "business") -> int:
+    try:
+        from playwright.sync_api import TimeoutError as PWTimeout, sync_playwright
+    except ImportError:
+        raise SystemExit("Playwright fehlt: pip install playwright && playwright install chromium")
+
+    print("  Starte codex login...")
+    proc, authorize_url = _start_codex_login()
+
+    if ACTIVE_AUTH.exists():
+        ACTIVE_AUTH.unlink()
+    auth_before = 0
+    browser = None
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="de-DE",
+            )
+            ctx.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            page = ctx.new_page()
+            page.goto(authorize_url, wait_until="domcontentloaded", timeout=30000)
+
+            _wait_visible(page, ['input[name="username"]', 'input[type="email"]'], 30000).fill(email)
+            _submit(page)
+
+            pw_field = _wait_visible(page, ['input[name="password"]', 'input[type="password"]'], 30000)
+            pw_field.fill(password)
+            _submit(page, pw_field)
+
+            otp_anchor   = None
+            otp_required = False
+            try:
+                otp_anchor   = _wait_visible(page, ['input[name="code"]', 'input[autocomplete="one-time-code"]'], 8000)
+                otp_required = True
+            except PWTimeout:
+                digits = page.locator('input[maxlength="1"], input[inputmode="numeric"]')
+                try:
+                    if digits.count() >= 6:
+                        otp_required = True
+                        otp_anchor   = digits.first
+                except Exception:
+                    pass
+
+            if otp_required:
+                if _imap_config():
+                    print("  OTP nötig — rufe via IMAP ab...")
+                    otp = _fetch_otp(wait=True)
+                else:
+                    print("  OTP nötig — kein IMAP konfiguriert (IMAP_HOST/IMAP_USER/IMAP_PASSWORD).")
+                    otp = None
+                if not otp:
+                    otp = input("  OTP manuell eingeben: ").strip()
+                if not re.fullmatch(r"\d{6}", otp or ""):
+                    raise SystemExit("OTP fehlt oder ungültig.")
+
+                otp_field = page.locator('input[name="code"], input[autocomplete="one-time-code"]').first
+                try:
+                    if otp_field.count() > 0:
+                        otp_field.clear()
+                        otp_field.fill(otp)
+                    elif not _fill_otp(page, otp):
+                        raise SystemExit("OTP-Eingabefeld nicht gefunden.")
+                except Exception:
+                    if not _fill_otp(page, otp):
+                        raise SystemExit("OTP-Eingabefeld nicht gefunden.")
+                _submit(page, otp_anchor)
+                try:
+                    page.wait_for_timeout(2000)
+                    if page.locator(':text("Falscher Code"), :text("Invalid code")').count() > 0:
+                        print("  OTP abgelehnt — bitte manuell eingeben:")
+                        manual = input("  OTP manuell: ").strip()
+                        if re.fullmatch(r"\d{6}", manual):
+                            try:
+                                f2 = page.locator('input[name="code"], input[autocomplete="one-time-code"]').first
+                                f2.clear()
+                                f2.fill(manual)
+                            except Exception:
+                                _fill_otp(page, manual)
+                            _submit(page, otp_anchor)
+                except Exception:
+                    pass
+
+            _handle_consent(page, workspace)
+
+            print("  Warte auf OAuth-Callback...")
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if ACTIVE_AUTH.exists() and ACTIVE_AUTH.stat().st_mtime > auth_before:
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    if not (ACTIVE_AUTH.exists() and ACTIVE_AUTH.stat().st_mtime > auth_before):
+        time.sleep(2)
+        if not (ACTIVE_AUTH.exists() and ACTIVE_AUTH.stat().st_mtime > auth_before):
+            raise SystemExit("auth.json wurde nicht aktualisiert — Login fehlgeschlagen.")
+
+    print(f"  Auth gespeichert: {ACTIVE_AUTH}")
+
+    session_limits = scan_session_limits()
+    state_data = _load_state()
+    account_state: dict = {"email": email, "last_login": iso(now())}
+    if session_limits:
+        account_state["limits"]    = session_limits["rate_limits"]
+        account_state["limits_at"] = session_limits["observed_at"]
+    state_data[name]      = account_state
+    state_data["current"] = name
+    _save_state(state_data)
+
+    if session_limits:
+        rl   = session_limits.get("rate_limits") or {}
+        p    = rl.get("primary") or {}
+        used = p.get("used_percent")
+        free = f"{max(0.0, 100.0 - float(used)):.0f}%" if isinstance(used, (int, float)) else "?"
+        print(f"  Limits (aus Session-Log): 5h {free} frei")
+    else:
+        print("  Limits: noch keine Session-Log-Daten")
+
+    print(f"\nOK — {name} eingeloggt.")
+    return 0
+
+# ---------------------------------------------------------------------------
+# CLI-Befehle
+# ---------------------------------------------------------------------------
+
+def cmd_login(args: argparse.Namespace) -> int:
+    accounts = parse_codex_env(CODEX_ENV_PATH)
+    if args.email:
+        matches = [a for a in accounts if a["email"] == args.email]
+        if not matches:
+            raise SystemExit(f"Email '{args.email}' nicht in codex.env.")
+        creds = matches[0]
+    else:
+        creds = pick_account(accounts)
+
+    email    = creds["email"]
+    password = creds.get("password", "").strip()
+    if not password:
+        raise SystemExit(f"Passwort für '{email}' fehlt.")
+    workspace = _pick_workspace(creds.get("workspace", "business"), getattr(args, "personal", False))
+    print(f"\nLogin: {email} (Tenant: {'Personal' if workspace == 'personal' else 'Workspace'})")
+    return do_login(email, email, password, workspace)
+
+
+def cmd_login_all(_: argparse.Namespace) -> int:
+    accounts = parse_codex_env(CODEX_ENV_PATH)
+    errors: list[str] = []
+    for creds in accounts:
+        email    = creds.get("email", "").strip()
+        password = creds.get("password", "").strip()
+        if not email or not password:
+            print(f"\n[{email or '?'}] Übersprungen: Email oder Passwort fehlt.")
+            errors.append(email or "?")
+            continue
+        print(f"\n{'='*50}\n{email}\n{'='*50}")
+        try:
+            rc = do_login(email, email, password, creds.get("workspace", "business"))
+            if rc != 0:
+                errors.append(email)
+        except (SystemExit, Exception) as exc:
+            print(f"[{email}] Fehler: {exc}")
+            errors.append(email)
+
+    total = len(accounts)
+    print(f"\n{total - len(errors)}/{total} Accounts eingeloggt.")
+    if errors:
+        print(f"Fehler: {', '.join(errors)}")
+    return 1 if errors else 0
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    state    = _load_state()
+    accounts: list[dict[str, str]] = []
+    try:
+        accounts = parse_codex_env(CODEX_ENV_PATH)
+    except SystemExit:
+        pass
+
+    current = state.get("current")
+    if current and current in state:
+        fresh = scan_session_limits()
+        if fresh:
+            state[current]["limits"]    = fresh["rate_limits"]
+            state[current]["limits_at"] = fresh["observed_at"]
+            _save_state(state)
+
+    emails = [a["email"] for a in accounts] or [k for k in state if k != "current"]
+    if not emails:
+        print("Keine Accounts bekannt.")
+        return 0
+
+    print(f"Aktiv: {current or 'unbekannt'}")
+    for e in emails:
+        marker = " *" if e == current else "  "
+        print(f"{marker}{e}{_limit_display(state.get(e, {}))}")
+    return 0
+
+
+def cmd_refresh(args: argparse.Namespace) -> int:
+    state   = _load_state()
+    current = args.name or state.get("current")
+    if not current:
+        raise SystemExit("Kein aktiver Account. Nutze: codex-login refresh NAME")
+    print(f"Token-Refresh für '{current}'...", end=" ", flush=True)
+    if refresh_tokens(ACTIVE_AUTH):
+        print("OK")
+        return 0
+    print("Fehlgeschlagen.")
+    return 1
+
+
+def interactive_menu() -> int:
+    while True:
+        print("\nCodex Login\n-----------")
+        print("1. Status anzeigen")
+        print("2. Account einloggen")
+        print("3. Alle Accounts einloggen")
+        print("4. Token-Refresh")
+        print("5. Beenden\n")
+        try:
+            choice = input("Auswahl [1]: ").strip() or "1"
+        except (KeyboardInterrupt, EOFError):
+            print("")
+            return 0
+        try:
+            if   choice == "1": cmd_status(argparse.Namespace())
+            elif choice == "2": cmd_login(argparse.Namespace(email=None, personal=False))
+            elif choice == "3": cmd_login_all(argparse.Namespace())
+            elif choice == "4": cmd_refresh(argparse.Namespace(name=None))
+            elif choice == "5" or choice.lower() in {"q", "quit", "exit"}: return 0
+            else: print("Ungültige Auswahl.")
+        except (KeyboardInterrupt, EOFError):
+            print("")
+            return 0
+        except SystemExit as exc:
+            if exc.code:
+                print(exc)
+
+
+def main() -> int:
+    if len(sys.argv) == 1:
+        return interactive_menu()
+
+    parser = argparse.ArgumentParser(
+        prog="codex-login",
+        description="ChatGPT OAuth-Login mit automatischem IMAP-OTP.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_login = sub.add_parser("login", help="Account einloggen (ohne Email: interaktive Auswahl).")
+    p_login.add_argument("email", nargs="?", default=None)
+    p_login.add_argument("-p", "--personal", action="store_true", help="Persönlichen Tenant verwenden.")
+    p_login.set_defaults(func=cmd_login)
+
+    p_all = sub.add_parser("login-all", help="Alle Accounts aus codex.env einloggen.")
+    p_all.set_defaults(func=cmd_login_all)
+
+    p_status = sub.add_parser("status", help="Login-Status und Limits anzeigen.")
+    p_status.set_defaults(func=cmd_status)
+
+    p_refresh = sub.add_parser("refresh", help="Access-Token für aktiven Account erneuern.")
+    p_refresh.add_argument("name", nargs="?", default=None)
+    p_refresh.set_defaults(func=cmd_refresh)
+
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
